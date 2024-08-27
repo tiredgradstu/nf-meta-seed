@@ -1,0 +1,1 @@
+# A Nextflow pipeline for metagenomic analysis of ornamental seed characterization and protein stuff.
