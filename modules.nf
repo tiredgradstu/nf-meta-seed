@@ -1,16 +1,13 @@
 // QC and trim reads
 process FASTP {
-    container 'oras://community.wave.seqera.io/library/fastp:0.23.4--4ea6310369653ec7'
     publishDir "$params.outdir/fastp", mode: 'copy', pattern: '*html'
     
     input:
     tuple val(sample_id), path(reads)
-
-    output:
+output:
     tuple val(sample_id), path('*fastq.gz'), emit: fastq
     path '*fastp_report*', emit: report
-
-    script:
+script:
     """
     fastp \
         -i ${reads[0]} \
@@ -22,132 +19,155 @@ process FASTP {
         -w $task.cpus
     """
 }
-
 // Download and extract a pre-made Kraken DB from a URL
-process KRAKEN_DL_DB {
+process KRAKENDB_DL_DB {
     input:
     val db_url
-
-    output:
+output:
     path 'kraken_db'
-
-    script:
+script:
     """
     wget $db_url
     tar -xzvf *.tar.gz -C kraken_db
     """
 }
-
 // Download the NCBI taxonomy as a starting point for a custom Kraken DB
-process KRAKEN_DL_TAX {
-    container 'oras://community.wave.seqera.io/library/kraken2:2.1.3--fb44221536fbccbe'
-
+process KRAKENDB_DL_TAX {
     output:
     path 'kraken_db_tax'
-
-    script:
+script:
     """
     kraken2-build --download-taxonomy --db kraken_db_tax
     """
 }
-
 // Download taxon-specific libraries as a starting point for a custom Kraken DB
-process KRAKEN_DL_LIB {
-    container 'oras://community.wave.seqera.io/library/kraken2:2.1.3--fb44221536fbccbe'
-
+process KRAKENDB_DL_LIB {
     input:
     val library
-
-    output:
-    path "kraken_db_lib_${library}"
-
-    script:
+output:
+    path '*'
+script:
     """
-    kraken2-build --download-library $library --db kraken_db_lib_${library}
+    kraken2-build --download-library $library --db db_dir
+mv db_dir/library/* .
+    rm -r db_dir
     """
 }
-
-// Add a set of custom genomes in a dir to a custom Kraken DB
-process KRAKEN_ADD {
-    container 'oras://community.wave.seqera.io/library/kraken2:2.1.3--fb44221536fbccbe'
-
+// Combine separate dirs with libraries into one
+process KRAKENDB_COMBINE_LIBS {
     input:
-    path genome_dir
+    path lib_dirs
+output:
+    path 'lib_dir'
+script:
+    """
+    mkdir -p lib_dir
+    cp -rLv $lib_dirs lib_dir/
+    """
+}
+// Add a set of custom genomes in a dir to a custom Kraken DB
+process KRAKENDB_COMBINE_AND_ADD {
+    input:
     path tax_dir
     path lib_dir
-
-    output:
+    path genomes_to_add_dir
+output:
     path "kraken_db_unbuilt"
-
-    script:
+script:
     """
     mkdir -p kraken_db_unbuilt/library
-    cp -r ${tax_dir}/taxonomy kraken_db_unbuilt
-    cp -r ${lib_dir}/library/* kraken_db_unbuilt/library
-
-    for fasta in ${genome_dir}/*; do
-        kraken2-build --add-to-library \$fasta --db kraken_db_unbuilt
-    done
+    cp -rLv ${tax_dir}/taxonomy kraken_db_unbuilt
+    cp -rLv ${lib_dir}/* kraken_db_unbuilt/library/
+if [[ -d ${genomes_to_add_dir} ]]; then
+        for fasta in ${genomes_to_add_dir}/*fna; do
+            kraken2-build --add-to-library \$fasta --db kraken_db_unbuilt
+        done
+    fi
     """
 }
-
 // Build the final custom Kraken DB
-process KRAKEN_BUILD {
-    container 'oras://community.wave.seqera.io/library/kraken2:2.1.3--fb44221536fbccbe'
-
+process KRAKENDB_BUILD {
     input:
     path kraken_db_unbuilt
-
-    output:
+output:
     path 'kraken_db'
-
-    script:
+script:
     """
     mkdir kraken_db
-    cp -r $kraken_db_unbuilt/* kraken_db/
-    kraken2-build --build --db kraken_db
+    cp -rLv $kraken_db_unbuilt/* kraken_db/
+    
+    kraken2-build --build --db kraken_db --threads $task.cpus
     """
 }
-
 // Run Kraken to assign taxonomy to reads
-process KRAKEN_RUN {
-    container 'oras://community.wave.seqera.io/library/kraken2:2.1.3--fb44221536fbccbe'
+process KRAKEN {
     publishDir "$params.outdir/kraken", mode: 'copy', pattern: '*txt'
-
-    input:
+input:
     tuple val(sample_id), path(reads)
     path(db)
-
-    output:
+output:
     tuple val(sample_id), path('*fastq'), emit: classified_fq
-    path '*main.txt', emit: main        // Classifications for each read, e.g. for Pavian
-    path '*report.txt', emit: report    // Summary, e.g. for MultiQC
-
-    script:
+    tuple val(sample_id), path('*report.txt'), emit: report
+    tuple val(sample_id), path('*main.txt'), emit: main
+    path '*report.txt', emit: report_path // For MultiQC, to avoid complications with tuple
+script:
     """
     kraken2 \
-        --threads $task.cpus \
         --db ${db} \
+        --report ${sample_id}_kraken-report.txt \
+        --output ${sample_id}_kraken-main.txt \
         --classified-out ${sample_id}#.fastq \
         --gzip-compressed \
         --paired \
-        --report ${sample_id}_report.txt \
+        --threads $task.cpus \
         ${reads[0]} \
-        ${reads[1]} \
-        > ${sample_id}_main.txt
+        ${reads[1]}
     """
 }
-
+// Build a Bracken DB
+process BRACKENDB_BUILD {
+    input:
+    path kraken_db
+    val read_len
+output:
+    path 'bracken_db'
+script:
+    """
+    cp -rLv $kraken_db bracken_db
+bracken-build -d bracken_db -l $read_len -t $task.cpus
+    """
+}
+// Run Bracken
+process BRACKEN {
+    publishDir "$params.outdir/bracken", mode: 'copy', pattern: '*txt'
+input:
+    tuple val(sample_id), path(kraken_report)
+    path bracken_db
+    val tax_level
+    val min_reads
+    val read_len
+output:
+    path '*bracken*txt'
+script:
+    """
+    bracken \
+        -i ${kraken_report} \
+        -d ${bracken_db} \
+        -o ${sample_id}_bracken-out.txt \
+        -w ${sample_id}_bracken-report.txt \
+        -r ${read_len} \
+        -l ${tax_level} \
+        -t ${min_reads}
+    """
+}
 // Assemble reads
 process ASSEMBLY {
-    container 'oras://community.wave.seqera.io/library/spades:3.15.5--5ae53542733e7564'
-
     input:
     tuple val(sample_id), path(reads)
     
     output:
-    path "${sample_id}.fasta"
-    path "${sample_id}_scaffolds.fasta"
+    path "${sample_id}_scaffolds.fasta", emit: fasta
+    path "${sample_id}_contigs.fasta"
     path "${sample_id}_spades.log"
     
     script:
@@ -159,26 +179,140 @@ process ASSEMBLY {
         -o outdir \
         --only-assembler \
         --meta \
+        --threads $task.cpus \
         --memory $memory_gb
     
-    mv outdir/contigs.fasta ${sample_id}.fasta
+    mv outdir/contigs.fasta ${sample_id}_contigs.fasta
     mv outdir/scaffolds.fasta ${sample_id}_scaffolds.fasta
     mv outdir/spades.log ${sample_id}_spades.log
     """
 }
-
 process MULTIQC {
-    container 'oras://community.wave.seqera.io/library/multiqc:1.22.1--ac0a91c1ae1c160c'
     publishDir "$params.outdir/multiqc", mode: 'copy'
-
-    input:
+input:
     path multiqc_input
-
-    output:
+output:
     path 'multiqc_report.html'
-
-    script:
+script:
     """
     multiqc .
+    """
+}
+process HOST_INDEX {
+    publishDir "${params.outdir}/hostindex", mode: "copy"
+    
+    input:
+    path host_fasta
+output:
+    path 'host_index_dir'
+script:
+    """
+    bowtie2-build $host_fasta host_index
+mkdir -p host_index_dir
+    mv *bt2 host_index_dir/
+    """
+}
+process HOST_REMOVE {
+    input:
+    path(host_index_dir)
+    tuple val(sample_id), path(reads)
+output:
+    tuple val(sample_id), path('*.fastq')
+shell:
+    '''
+    index_prefix=$(ls !{host_index_dir} | head -n1 | sed -E "s/.[0-9]+.bt2//")
+    index_prefix_full=!{host_index_dir}/$index_prefix
+bowtie2 \
+        -p !{task.cpus} \
+        -x $index_prefix_full \
+        -1 !{reads[0]} \
+        -2 !{reads[1]} \
+        --local \
+        --un-conc \
+        !{sample_id}_host_removed_reads \
+        > !{sample_id}_mapped_unmapped.sam
+mv !{sample_id}_host_removed_reads.1 !{sample_id}_hostrm_R1.fastq
+    mv !{sample_id}_host_removed_reads.2 !{sample_id}_hostrm_R2.fastq
+    '''
+}
+process MAXBIN2 {
+    input:
+    tuple val(sample_id), path(assembly), path(reads)
+output:
+    tuple val(sample_id), path ('*.fasta'), emit: fasta
+script:
+    """
+    run_MaxBin.pl \
+        -contig $assembly \
+        -reads ${reads[0]} \
+        -reads2 ${reads[1]} \
+        -out $sample_id
+    """
+}
+process METABAT2 {
+    input:
+    tuple val(sample_id), path(assembly), path(bam), path(bam_idx), path(bed)
+output:
+    path '*.fa', emit: fasta, optional: true
+    path 'depth.txt'
+script:
+    """
+    jgi_summarize_bam_contig_depths --outputDepth depth.txt "$bam"
+metabat2 -i "$assembly" -a depth.txt -m 1500 --maxP 75 -s 100000 -o "$sample_id"
+    """
+}
+process CONCOCT {
+    input:
+    tuple val(sample_id), path(assembly), path(bam), path(bam_idx), path(bed)
+output:
+    path 'contigs10k.fasta'
+    path 'covtable.tsv'
+    path 'clustering_gt1000.csv'
+    path 'merged.csv'
+    path ('*.fa'), emit: fasta, optional: true
+    //path 'fasta_bins/'
+script:
+    """
+    cut_up_fasta.py "$assembly" -c 100000 --merge_last -b "$bed" > contigs10k.fasta
+    concoct_coverage_table.py "$bed" "$bam" > covtable.tsv
+    concoct --composition_file contigs10k.fasta --coverage_file covtable.tsv -s 100
+    merge_cutup_clustering.py clustering_gt1000.csv > merged.csv
+mkdir -p fasta_bins
+    extract_fasta_bins.py "$assembly" merged.csv --output_path fasta_bins
+    """
+}
+process DREP {
+    publishDir "${params.outdir}/drep", mode: "copy", pattern: "dereplicated_genomes"
+    
+    input:
+    path fasta_dir
+output:
+    path 'data_tables'
+    path 'dereplicated_genomes', emit: depreplicated_genomes
+    path 'data/checkM/checkM_outdir/results.tsv', emit: checkM_result
+    // flexible, probably best to specify what you want right here rather than down the line
+script:
+    """
+    dRep dereplicate \
+        'drep_out' \
+        -g "$fasta_dir/*.fa"
+    """
+}
+process MAP2ASSEMBLY {
+    input:
+    tuple val(sample_id), path(reads)
+    tuple val(sample_id), path(assembly)
+output:
+    tuple val(sample_id),
+          path("${sample_id}.bam"),
+          path("${sample_id}.bam.bai"),
+          path("${sample_id}.bed")
+script:
+    """
+    bwa index -p "$sample_id" "$assembly"
+bwa mem -t $task.cpus -a "$sample_id" ${reads[0]} ${reads[1]} |
+        samtools sort -o "$sample_id".bam -
+samtools index "$sample_id".bam
+bedtools bamtobed -i "$sample_id".bam > "$sample_id".bed
     """
 }

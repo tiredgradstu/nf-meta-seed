@@ -7,18 +7,36 @@ set -euo pipefail
 
 # Load the Nextflow Conda environment
 module load miniconda3/24.1.2-py310
-conda activate /fs/ess/PAS0471/jelmer/conda/nextflow
+conda activate /users/PAS2693/zenmckenzie14/miniconda3/envs/nextflow
 
 # Point to the main workflow file/dir
-WORKFLOW=main.nf    # Eventually, this should point to a GitHub repo
+WORKFLOW=git@github.com:zenmck/nf-meta-seed.git   
+# Constants
+#[[ -n $SLURM_JOB_ACCOUNT ]] && osc_account=$(echo "$SLURM_JOB_ACCOUNT" | tr "[:lower:]" "[:upper:]") //ask about this
+WORKFLOW=/fs/ess/PAS2693/jelmer/meta_pipeline
+WORKDIR=/fs/scratch/PAS2693/nf-meta
+OUTDIR=results/nf-meta
 
 # Report
-date
 echo
+date
+echo -e "\n# Starting Nextflow run with Nextflow base call:"
+echo "nextflow run $WORKFLOW -ansi-log false -resume -work-dir $WORKDIR" 
+echo -e "\n# ... and with pipeline parameters:"
+echo "--outdir $OUTDIR $*"
+echo -e "\n==========================================\n"
+
+# Run the workflow
+nextflow run $WORKFLOW \
+    -ansi-log false \
+    -resume \
+    --outdir "$OUTDIR" \
+    -work-dir "$WORKDIR" \
+    "$@"
+
+# Report
+echo
+date
 
 # Run the workflow
 nextflow run $WORKFLOW -ansi-log false -resume "$@"
-
-# Report
-echo
-date

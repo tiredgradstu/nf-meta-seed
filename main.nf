@@ -1,111 +1,112 @@
-include { FASTP } from './modules.nf'
-include { DOWNLOAD_KRAKEN_DB } from './modules.nf'
-include { KRAKEN } from './modules.nf'
-include { KRAKEN_DL_TAX } from './modules.nf'
-include { KRAKEN_DBDL_LIB } from './modules.nf'
-include { KRAKEN_DBDL_ADDGENO } from './modules.nf'
-include { KRAKEN_DB_BUILD_BUILD } from './modules.nf'
-
-
-workflow {
-    reads_ch = Channel.fromFilePairs(params.reads, checkIfExists: true)
-    
-    fastp_ch = FASTP(reads_ch)
-
-    // Download Kraken db *if* no db is provided to the pipeline
-    kraken_db_ch = params.kraken_db 
-        // Turn into a value channel with .first() when we create teh channel from a file.
-        ? Channel.fromPath(params.kraken_db, checkIfExists: true).first()
-        : DOWNLOAD_KRAKEN_DB(params.kraken_db_url)
-
-    KRAKEN(fastp_ch.fastq, kraken_db_ch)
-
-    // Build a custom Kraken Db
-    tax_ch = KRAKEN_DL_TAX()
-    lib_ch = KRAKEN_DBDL_LIB(params.library)
-    db_unbuilt_ch = KRAKEN_DBDL_ADDGENO(params.genome_dir, tax_ch, lib_ch)
-    KRAKEN_DB_BUILD_BUILD(db_unbuilt_ch)
-
-    //ASSEMBLY (fastp_ch.fastq)
-
-}
-
-workflow.onComplete {
-    log.info ( workflow.success ? "\nDone! Open the following report in your browser --> $params.outdir/mockdata_preports\n" : "Oops .. something went wrong" )
-}
-
-
 #!/usr/bin/env nextflow
-
 // Process parameters
 krakendb_libs = params.krakendb_libs ? params.krakendb_libs?.split(',') as List : null
-//krakendb_libs = params.krakendb_libs?.split(',') as List
-
 // Report
 log.info """
     M E T A G E N O M I C S - N F   P I P E L I N E
-    ===============================================
-    Reads                                           : ${params.reads}
-    Outdir                                          : ${params.outdir}
-    Path to pre-existing Kraken DB (if any)         : ${params.krakendb_dir}
-    URL to pre-existing Kraken DB (if any)          : ${params.krakendb_url}
-    Dir with genomes for custom Kraken DB (if any)  : ${params.krakendb_add}
-    Library/ies for custom Kraken DB (if any)       : ${params.krakendb_libs}
-    ===============================================
+    ==============================================================
+    Reads in FASTQ files                                : ${params.reads}
+    Output directory                                    : ${params.outdir}
+    Path to pre-existing Kraken DB (if any)             : ${params.krakendb_dir}
+    Dir with genomes for custom Kraken DB (if any)      : ${params.krakendb_add}
+    Library/ies for custom Kraken DB (if any)           : ${params.krakendb_libs}
+    Path to pre-existing Kraken library dir (if any)    : ${params.krakendb_libdir}
+    Taxonomic level for Bracken                         : ${params.bracken_taxlevel}
+    Read length for Bracken                             : ${params.bracken_readlen}
+    Min. nr. of reads for Bracken                       : ${params.bracken_minreads}
+    ==============================================================
     """
     .stripIndent(true)
-
 // Import processes
 include { FASTP } from './modules.nf'
-include { KRAKEN_DL_DB } from './modules.nf'
-include { KRAKEN_DL_TAX } from './modules.nf'
-include { KRAKEN_DL_LIB } from './modules.nf'
-include { KRAKEN_ADD } from './modules.nf'
-include { KRAKEN_BUILD } from './modules.nf'
-include { KRAKEN_RUN } from './modules.nf'
+include { KRAKENDB_DL_DB } from './modules.nf'
+include { KRAKENDB_DL_TAX } from './modules.nf'
+include { KRAKENDB_DL_LIB } from './modules.nf'
+include { KRAKENDB_COMBINE_AND_ADD } from './modules.nf'
+include { KRAKENDB_BUILD } from './modules.nf'
+include { KRAKENDB_COMBINE_LIBS } from './modules.nf'
+include { KRAKEN } from './modules.nf'
+include { BRACKENDB_BUILD } from './modules.nf'
+include { BRACKEN } from './modules.nf'
 include { ASSEMBLY } from './modules.nf'
+include { MAP2ASSEMBLY } from './modules.nf'
 include { MULTIQC } from './modules.nf'
-
+include { HOST_INDEX } from './modules.nf'
+include { HOST_REMOVE } from './modules.nf'
+include { CONCOCT } from './modules.nf'
+include { METABAT2 } from './modules.nf'
+include { MAXBIN2 } from './modules.nf'
+include { DREP } from './modules.nf'
 // Define the workflow
 workflow  {
     // Create channels from input files
     reads_ch = Channel.fromFilePairs(params.reads, checkIfExists: true)
+    host_asm_ch = Channel.fromPath(params.host_asm).first()
     krakendb_ch = params.krakendb_dir
         ? Channel.fromPath(params.krakendb_dir, checkIfExists: true).first()
         : null
     krakendb_add_ch = params.krakendb_add
         ? Channel.fromPath(params.krakendb_add, checkIfExists: true).first()
-        : null
+        : Channel.empty()
     krakendb_liblist_ch = krakendb_libs ? Channel.fromList(krakendb_libs) : null
-
-    // Read preprocessing and QC
+    krakendb_lib_ch = params.krakendb_libdir
+        ? Channel.fromPath(params.krakendb_libdir, checkIfExists: true)
+        : null
+    
+    // Create an index for the host reference genome, or use a pre-existing one
+    host_index_ch = params.host_index
+        ? Channel.fromPath(params.host_index, checkIfExists: true)
+        : (HOST_INDEX(host_asm_ch))
+// Read preprocessing and QC
     fastp_ch = FASTP(reads_ch)
     
-    // Kraken
+    // Kraken and Bracken DB-building
     if (!krakendb_ch) {
-        if (krakendb_add_ch && krakendb_liblist_ch) {
-            println "\nNOTE: The pipeline will build and use a custom Kraken DB\n"
-            krakendb_tax_ch = KRAKEN_DL_TAX()
-            krakendb_lib_ch = KRAKEN_DL_LIB(krakendb_liblist_ch)
-            krakendb_unbuilt_ch = KRAKEN_ADD(krakendb_add_ch, krakendb_tax_ch, krakendb_lib_ch)
-            krakendb_ch = KRAKEN_BUILD(krakendb_unbuilt_ch)
-        } else {
-            println "\nNOTE: The pipeline will download and use an online Kraken DB\n"
-            krakendb_ch = KRAKEN_DL_DB(params.krakendb_url)
+        krakendb_tax_ch = KRAKENDB_DL_TAX()
+        // If no library-dir was provided, download libraries:
+        if (!krakendb_lib_ch) {
+            krakendb_lib_ch = KRAKENDB_DL_LIB(krakendb_liblist_ch).collect()
+            krakendb_lib_ch = KRAKENDB_COMBINE_LIBS(krakendb_lib_ch)
         }
-    } else {
-        println "\nNOTE: The pipeline will use the provided Kraken DB ($params.krakendb_dir)\n"
-    }
-    kraken_ch = KRAKEN_RUN(fastp_ch.fastq, krakendb_ch)
-
-    // Assembly and binning
-    ASSEMBLY(fastp_ch.fastq)
-
-    // MultiQC
-    mqc_in_ch = kraken_ch.report.mix(fastp_ch.report).collect()
+        // Combine taxonomy, libraries, and optionally custom-addition genomes:
+        krakendb_unbuilt_ch = KRAKENDB_COMBINE_AND_ADD(
+            krakendb_tax_ch,
+            krakendb_lib_ch,
+            krakendb_add_ch.ifEmpty(file('no_add'))
+            )
+        krakendb_ch = KRAKENDB_BUILD(krakendb_unbuilt_ch).first()
+    }     
+    bracken_db_ch = BRACKENDB_BUILD(krakendb_ch, params.bracken_readlen)
+// Run Kraken and Bracken
+    kraken_ch = KRAKEN(fastp_ch.fastq, krakendb_ch)
+    bracken_ch = BRACKEN(
+        kraken_ch.report,
+        bracken_db_ch,
+        params.bracken_taxlevel,
+        params.bracken_minreads,
+        params.bracken_readlen
+        )
+// Host removal
+    host_remove_ch = HOST_REMOVE(host_index_ch, fastp_ch.fastq)
+    //TODO Kraken after host removal? Or use kraken_extract to do host removal? 
+// Assembly
+    asm_ch = ASSEMBLY(host_remove_ch)
+    asm_map_ch = MAP2ASSEMBLY(fastp_ch.fastq, asm_ch.fasta)
+    asm_and_map_ch = asm_ch.fasta.join(asm_map_ch)
+    asm_and_map_and_reads_ch = asm_and_map_ch.join(fastp_ch.fastq)
+// binners
+    concoct_ch = CONCOCT(asm_and_map_ch)
+    maxbin_ch = MAXBIN2(asm_and_map_and_reads_ch)
+    metabat_ch = METABAT2(asm_and_map_ch)
+    bins_ch = concoct_ch.fasta.join(maxbin_ch.fasta).join(metabat_ch.fasta)
+// deprelicate and checkm
+    drep_ch = DREP(bins_ch)
+// Assembly QC
+    // checkm, Busco, etc
+// MultiQC
+    mqc_in_ch = kraken_ch.report_path.mix(fastp_ch.report).collect()
     MULTIQC(mqc_in_ch)
 }
-
 // Report
 workflow.onComplete {
     if (workflow.success) {
